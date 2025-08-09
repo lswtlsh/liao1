@@ -1,0 +1,495 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no" />
+  <title>廖虎传 · 第一章 触屏RPG 原型（Part 1/多段）</title>
+  <style>
+    html, body { margin:0; padding:0; background:#0b0e16; height:100%; }
+    #game { width:100vw; height:100vh; display:block; }
+    .phaser-debug { font-family: monospace; font-size: 12px; color: #9ee5ff; }
+  </style>
+  <!-- Phaser 3 CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/phaser@3.60.0/dist/phaser.min.js"></script>
+</head>
+<body>
+  <div id="game"></div>
+
+<script>
+/**
+ * 廖虎传（原型·第一部分）
+ * 目标：给你一个“可直接运行”的触屏RPG框架：
+ * - 触屏虚拟摇杆 + 技能按钮
+ * - 可对话、简单任务、背包、基础战斗
+ * - 程序化小地图与可探索场景（可拓展为大地图/章节）
+ *
+ * 说明：这是多段工程的第1部分（几百行）。你可以先运行本文件，确认能玩。
+ * 后续我会把：剧情系统、技能树、存档、Boss战、更多地图与UI 等继续追加成多段，
+ * 直到达到你要的“上千行/上万行级别”。
+ */
+
+// -------------------------------------
+// 工具
+// -------------------------------------
+const clamp = (v, min, max) => Math.max(min, Math.min(max, v));
+const randInt = (a, b) => (a + Math.floor(Math.random() * (b - a + 1)));
+const pick = arr => arr[Math.floor(Math.random()*arr.length)];
+
+// -------------------------------------
+// 简单的本地“资源”——使用矢量/程序绘制代替图片，保证开箱即玩
+// -------------------------------------
+function makeCircleTexture(scene, key, radius, fill, stroke) {
+  const g = scene.make.graphics({x:0,y:0, add:false});
+  g.fillStyle(fill ?? 0xffffff, 1);
+  g.fillCircle(radius, radius, radius);
+  if (stroke) { g.lineStyle(4, stroke, 1); g.strokeCircle(radius, radius, radius-2); }
+  g.generateTexture(key, radius*2, radius*2);
+  g.destroy();
+}
+
+function makeRectTexture(scene, key, w, h, fill, stroke) {
+  const g = scene.make.graphics({x:0,y:0, add:false});
+  g.fillStyle(fill ?? 0x666666, 1);
+  g.fillRect(0, 0, w, h);
+  if (stroke) { g.lineStyle(4, stroke, 1); g.strokeRect(2, 2, w-4, h-4); }
+  g.generateTexture(key, w, h);
+  g.destroy();
+}
+
+// 生成“动漫风”头像占位
+function makeFaceTexture(scene, key, color) {
+  const g = scene.make.graphics({x:0,y:0, add:false});
+  g.fillStyle(color, 1);
+  g.fillRoundedRect(0,0,128,128,20);
+  g.fillStyle(0xffffff, 1); // 眼睛
+  g.fillCircle(44,56,14); g.fillCircle(84,56,14);
+  g.fillStyle(0x000000,1); g.fillCircle(44,56,7); g.fillCircle(84,56,7);
+  g.fillStyle(0xff8aa1,1); g.fillCircle(64,92,10); // 鼻
+  g.generateTexture(key, 128, 128);
+  g.destroy();
+}
+
+// -------------------------------------
+// 虚拟摇杆 + 按钮
+// -------------------------------------
+class VirtualJoystick {
+  constructor(scene, x, y, radius) {
+    this.scene = scene;
+    this.base = scene.add.image(x, y, 'vj_base').setAlpha(0.6).setScrollFactor(0).setDepth(1000);
+    this.knob = scene.add.image(x, y, 'vj_knob').setAlpha(0.9).setScrollFactor(0).setDepth(1001);
+    this.radius = radius;
+    this.pointerId = null;
+    this.value = new Phaser.Math.Vector2();
+
+    this.base.setInteractive({ draggable: false, useHandCursor:false });
+
+    scene.input.on('pointerdown', (p)=>{
+      if (p.x < scene.scale.width*0.5 && this.pointerId === null) {
+        this.pointerId = p.id;
+        this.base.setPosition(p.x, p.y);
+        this.knob.setPosition(p.x, p.y);
+      }
+    });
+
+    scene.input.on('pointermove', (p)=>{
+      if (p.id !== this.pointerId) return;
+      const dx = p.x - this.base.x;
+      const dy = p.y - this.base.y;
+      const dist = Math.sqrt(dx*dx+dy*dy);
+      const ang = Math.atan2(dy, dx);
+      const d = Math.min(this.radius, dist);
+      this.knob.setPosition(this.base.x + Math.cos(ang)*d, this.base.y + Math.sin(ang)*d);
+      this.value.set((dx===0&&dy===0)?0:(dx/this.radius), (dx===0&&dy===0)?0:(dy/this.radius));
+      this.value.limit(1);
+    });
+
+    scene.input.on('pointerup', (p)=>{
+      if (p.id !== this.pointerId) return;
+      this.pointerId = null;
+      this.knob.setPosition(this.base.x, this.base.y);
+      this.value.set(0,0);
+    });
+  }
+}
+
+class TouchButton {
+  constructor(scene, x, y, key, onTap) {
+    this.scene = scene;
+    this.img = scene.add.image(x, y, key).setScrollFactor(0).setDepth(1000).setAlpha(0.9);
+    this.img.setInteractive({useHandCursor:false});
+    this.onTap = onTap;
+    this.pointerId = null;
+    scene.input.on('pointerdown', p=>{
+      if (this.pointerId===null && Phaser.Geom.Rectangle.Contains(this.img.getBounds(), p.x, p.y)) {
+        this.pointerId = p.id; this._press(); this.onTap && this.onTap();
+      }
+    });
+    scene.input.on('pointerup', p=>{ if (p.id===this.pointerId){ this.pointerId=null; this._release(); }});
+  }
+  _press(){ this.img.setScale(0.95); }
+  _release(){ this.img.setScale(1); }
+}
+
+// -------------------------------------
+// 对话框/提示
+// -------------------------------------
+class DialogBox {
+  constructor(scene) {
+    this.scene = scene;
+    this.container = scene.add.container(0, 0).setScrollFactor(0).setDepth(2000);
+    const w = scene.scale.width; const h = scene.scale.height;
+    this.bg = scene.add.rectangle(w/2, h-120, w-24, 180, 0x000000, 0.55).setStrokeStyle(2, 0x7fffff, 0.6);
+    this.nameText = scene.add.text(24, h-190, '', {fontFamily:'system-ui,Segoe UI', fontSize:18, color:'#a0f0ff'});
+    this.text = scene.add.text(24, h-160, '', {fontFamily:'system-ui,Segoe UI', fontSize:20, color:'#ffffff', wordWrap:{width:w-64}});
+    this.face = scene.add.image(w-96, h-160, 'face_liao').setDisplaySize(72,72).setVisible(false);
+    this.tap = scene.add.text(w-120, h-40, '轻触继续 ▶', {fontSize:14, color:'#a0f0ff'});
+    this.container.add([this.bg, this.nameText, this.text, this.face, this.tap]);
+    this.container.setVisible(false);
+
+    this._queue = [];
+    this._onComplete = null;
+
+    scene.input.on('pointerdown', ()=>{ if(this.container.visible) this._next(); });
+  }
+  say(lines, onComplete){
+    this._queue = lines.slice();
+    this._onComplete = onComplete || null;
+    this.container.setVisible(true);
+    this._next();
+  }
+  _next(){
+    if (this._queue.length===0){ this.container.setVisible(false); if(this._onComplete) this._onComplete(); return; }
+    const item = this._queue.shift();
+    // item: {name, text, faceKey}
+    this.nameText.setText(item.name || '');
+    this.text.setText(item.text || '');
+    if (item.faceKey) { this.face.setTexture(item.faceKey).setVisible(true); } else { this.face.setVisible(false); }
+  }
+}
+
+// -------------------------------------
+// 简单的角色与战斗
+// -------------------------------------
+class Actor extends Phaser.Physics.Arcade.Sprite {
+  constructor(scene, x, y, key) {
+    super(scene, x, y, key);
+    scene.add.existing(this);
+    scene.physics.add.existing(this);
+    this.setCollideWorldBounds(true);
+    this.stats = { hp:100, hpMax:100, atk:10, def:2, speed:140, name:'未知' };
+    this.dir = new Phaser.Math.Vector2(0,1);
+    this.lastHitTime = 0;
+  }
+  hurt(dmg){
+    const real = Math.max(1, dmg - this.stats.def);
+    this.stats.hp = clamp(this.stats.hp - real, 0, this.stats.hpMax);
+    const t = this.scene.add.text(this.x, this.y-30, `-${real}`, {fontSize:14, color:'#ff5f6d'}).setDepth(9999);
+    this.scene.tweens.add({ targets:t, y: t.y-30, alpha:0, duration:600, onComplete:()=>t.destroy() });
+    if (this.stats.hp<=0) { this.die(); }
+  }
+  die(){ this.setTint(0x444444); this.setVelocity(0,0); this.body.enable=false; this.scene.time.delayedCall(700, ()=>this.destroy()); }
+}
+
+class Player extends Actor {
+  constructor(scene, x, y) {
+    super(scene, x, y, 'player');
+    this.stats.name = '廖虎';
+    this.stats.hpMax = 120; this.stats.hp = 120; this.stats.atk = 18; this.stats.speed = 160; this.stats.def = 4;
+    this.inventory = [];
+  }
+}
+
+class Enemy extends Actor {
+  constructor(scene, x, y, label) {
+    super(scene, x, y, 'enemy');
+    this.stats.name = label;
+    const base = { atk:12, def:2, hpMax: 80 };
+    const diff = { '王龙':{atk:16,hpMax:110}, '刘无':{atk:12,hpMax:90}, '杨鸡':{atk:10,hpMax:70}, '李狗':{atk:14,hpMax:95} }[label] || {};
+    this.stats = Object.assign(this.stats, base, diff);
+    this.stats.hp = this.stats.hpMax;
+  }
+}
+
+// -------------------------------------
+// 主场景：小型开放区 + 对话 + 敌人巡逻/追击 + 基础战斗
+// -------------------------------------
+class GameScene extends Phaser.Scene {
+  constructor(){ super('Game'); }
+  create(){
+    const W = this.scale.width; const H = this.scale.height;
+
+    // 背景地面（程序化）
+    const tile = 64; const cols = Math.ceil(W/tile)+2; const rows = Math.ceil(H/tile)+2;
+    this.bg = this.add.container();
+    for (let y=0;y<rows;y++){
+      for (let x=0;x<cols;x++){
+        const c = (x+y)%2===0?0x14303a:0x0f232a; // 深浅交替
+        const k = `tile_${c}`;
+        if (!this.textures.exists(k)) makeRectTexture(this, k, tile, tile, c);
+        this.bg.add(this.add.image(x*tile, y*tile, k).setOrigin(0));
+      }
+    }
+
+    // 生成程序化“树/石头”障碍
+    this.obstacles = this.physics.add.staticGroup();
+    for (let i=0;i<24;i++){
+      const ox = randInt(100, W-100), oy = randInt(100, H-140);
+      const size = randInt(24, 44);
+      const key = `rock_${size}`;
+      if (!this.textures.exists(key)) makeCircleTexture(this, key, size, 0x264653, 0x2a9d8f);
+      const r = this.add.image(ox, oy, key).setDepth(1);
+      this.obstacles.add(r);
+    }
+
+    // 角色贴图占位
+    if (!this.textures.exists('player')) makeRectTexture(this, 'player', 40, 54, 0x87ceeb, 0x13334c);
+    if (!this.textures.exists('enemy')) makeRectTexture(this, 'enemy', 40, 54, 0xff9b71, 0x6b2d1a);
+
+    // 头像
+    makeFaceTexture(this, 'face_liao', 0x0ea5e9);
+    makeFaceTexture(this, 'face_villager', 0x38bdf8);
+
+    // 玩家
+    this.player = new Player(this, W*0.5, H*0.6);
+    this.cameras.main.startFollow(this.player, true, 0.12, 0.12);
+
+    // 敌人
+    const names = ['王龙','刘无','杨鸡','李狗'];
+    this.enemies = this.add.group();
+    for (let i=0;i<8;i++){
+      const e = new Enemy(this, randInt(100,W-100), randInt(100,H-160), pick(names));
+      this.enemies.add(e);
+    }
+
+    // 碰撞
+    this.physics.add.collider(this.player, this.obstacles);
+    this.physics.add.collider(this.enemies, this.obstacles);
+
+    // 伤害判定：近战
+    this.lastAttackTime = 0; this.attackCooldown = 320;
+    this.physics.add.overlap(this.player, this.enemies, (p,e)=>{
+      // 敌人主动攻击：
+      const now = this.time.now;
+      if (now - e.lastHitTime > 700){
+        e.lastHitTime = now;
+        p.hurt(e.stats.atk);
+      }
+    });
+
+    // 敌人行为AI：巡逻/追击
+    this.time.addEvent({ loop:true, delay:250, callback:()=>{
+      this.enemies.getChildren().forEach(e=>{
+        if (!e.body || !this.player.body) return;
+        const dx = this.player.x - e.x; const dy = this.player.y - e.y;
+        const d2 = dx*dx+dy*dy; // 距离平方
+        const chase = d2 < 240*240;
+        if (chase){
+          const v = new Phaser.Math.Vector2(dx, dy).normalize().scale(90);
+          e.setVelocity(v.x, v.y);
+        } else {
+          // 随机巡逻
+          if (Math.random()<0.1){
+            const vx = randInt(-50,50), vy = randInt(-50,50);
+            e.setVelocity(vx, vy);
+          }
+        }
+      });
+    }});
+
+    // UI：血条与简单HUD
+    this.ui = this.add.container(0,0).setScrollFactor(0).setDepth(1500);
+    const hpBg = this.add.rectangle(120, 24, 220, 16, 0x000000, 0.4).setStrokeStyle(2,0x7fffff,0.6);
+    this.hpBar = this.add.rectangle(120-108, 24, 216, 12, 0x00e7ff).setOrigin(0,0.5);
+    const name = this.add.text(12, 4, '廖虎 Lv.1', {fontSize:14, color:'#9ee5ff'});
+    this.questText = this.add.text(12, 44, '主线：风起川蜀 · 寻访老村长', {fontSize:14, color:'#e2f7ff'});
+    this.ui.add([hpBg, this.hpBar, name, this.questText]);
+
+    // 对话框
+    this.dialog = new DialogBox(this);
+
+    // 虚拟摇杆/按钮 美术
+    makeCircleTexture(this, 'vj_base', 56, 0x003344, 0x46c7ff);
+    makeCircleTexture(this, 'vj_knob', 28, 0x46c7ff, 0xffffff);
+    makeRectTexture(this, 'btn_a', 72, 72, 0x003b2f, 0x39e697);
+    makeRectTexture(this, 'btn_b', 72, 72, 0x3b001b, 0xff5fa3);
+
+    // 虚拟摇杆 + 技能按钮
+    this.vj = new VirtualJoystick(this, 90, H-90, 60);
+    this.btnAttack = new TouchButton(this, W-90, H-90, 'btn_a', ()=>this.playerAttack());
+    this.btnSkill = new TouchButton(this, W-180, H-150, 'btn_b', ()=>this.playerSkill());
+
+    // 新手引导对话
+    this.time.delayedCall(600, ()=>{
+      this.dialog.say([
+        {name:'廖虎', text:'（醒来）这是哪里？昨夜里…仿佛听见“老卤”的呼唤。', faceKey:'face_liao'},
+        {name:'？？', text:'前路多险，先熟悉行动吧。左侧摇杆移动，右侧按钮攻击/技能。', faceKey:'face_villager'},
+        {name:'廖虎', text:'我得去村口找到老村长，问清“王龙”等人的下落。', faceKey:'face_liao'},
+      ]);
+    });
+
+    // 与“老村长”触发点（模拟）
+    this.villager = this.add.image(W*0.5, 110, 'face_villager').setScale(0.8).setDepth(10);
+    this.physics.add.existing(this.villager, true);
+    this.physics.add.overlap(this.player, this.villager, ()=>{
+      if (this._talked) return;
+      this._talked = true;
+      this.dialog.say([
+        {name:'老村长', text:'你总算醒啦！王龙、刘无、杨鸡、李狗四人搅得川蜀不宁。', faceKey:'face_villager'},
+        {name:'老村长', text:'先去练练身手，清理周围恶徒。带回一枚“青石牌”给我看。', faceKey:'face_villager'},
+        {name:'廖虎', text:'明白！', faceKey:'face_liao'}
+      ], ()=>{ this.questText.setText('主线：击败任意敌人，概率掉落“青石牌”（返回村长）'); });
+    });
+
+    // 掉落物
+    this.drops = this.physics.add.group();
+    this.physics.add.overlap(this.player, this.drops, (p,d)=>{
+      this.pickupDrop(d);
+    });
+
+    // 返回村长交付
+    this.time.addEvent({ delay:1000, loop:true, callback:()=>{
+      if (!this._hasToken) return;
+      const near = Phaser.Math.Distance.Between(this.player.x, this.player.y, this.villager.x, this.villager.y) < 80;
+      if (near && !this._submitted){
+        this._submitted = true;
+        this.dialog.say([
+          {name:'老村长', text:'好身手！这“青石牌”果然四贼的信物。', faceKey:'face_villager'},
+          {name:'老村长', text:'据探子报：王龙已潜入东林古道。先从他开始！', faceKey:'face_villager'},
+          {name:'廖虎', text:'王龙…等我！', faceKey:'face_liao'}
+        ], ()=>{
+          this.questText.setText('主线：前往【东林古道】（下一章将在Part 2开放）');
+        });
+      }
+    }});
+  }
+
+  update(time, delta){
+    // 移动
+    const v = this.vj.value; // -1..1
+    const sp = this.player.stats.speed;
+    this.player.setVelocity(v.x*sp, v.y*sp);
+    if (v.length()>0){ this.player.dir.set(v.x, v.y).normalize(); }
+
+    // 更新HP条
+    const ratio = this.player.stats.hp / this.player.stats.hpMax;
+    this.hpBar.width = 216 * clamp(ratio,0,1);
+  }
+
+  playerAttack(){
+    const now = this.time.now;
+    if (now - this.lastAttackTime < this.attackCooldown) return;
+    this.lastAttackTime = now;
+    // 近战扇形
+    const origin = new Phaser.Math.Vector2(this.player.x, this.player.y);
+    const dir = this.player.dir.clone().normalize();
+    const range = 62; const arc = Math.PI/3;
+    const hit = [];
+    this.enemies.getChildren().forEach(e=>{
+      const v = new Phaser.Math.Vector2(e.x - origin.x, e.y - origin.y);
+      if (v.length() <= range){
+        const a = Phaser.Math.Angle.Wrap(Math.atan2(dir.y, dir.x) - Math.atan2(v.y, v.x));
+        if (Math.abs(a) <= arc/2) hit.push(e);
+      }
+    });
+    if (hit.length){
+      this.addFlash(this.player.x + dir.x*30, this.player.y + dir.y*30);
+      hit.forEach(t=>t.hurt(this.player.stats.atk));
+      this.tryDrop(hit);
+    }
+  }
+
+  playerSkill(){
+    // 简易冲刺斩
+    const dir = this.player.dir.clone().normalize();
+    const dashDist = 100; const sp = 400;
+    const target = new Phaser.Math.Vector2(this.player.x + dir.x*dashDist, this.player.y + dir.y*dashDist);
+    this.physics.moveTo(this.player, target.x, target.y, sp, 140);
+    this.time.delayedCall(140, ()=>{ this.player.setVelocity(0,0); });
+
+    // 冲刺路径伤害
+    this.enemies.getChildren().forEach(e=>{
+      if (!e.body) return;
+      const d = Phaser.Math.Distance.BetweenPoints(this.player, e);
+      if (d < 120) e.hurt(this.player.stats.atk + 12);
+    });
+    this.addFlash(this.player.x, this.player.y);
+  }
+
+  addFlash(x,y){
+    const g = this.add.circle(x, y, 6, 0x7ff7ff).setDepth(9999);
+    this.tweens.add({ targets:g, radius: 80, alpha:0, duration:240, onComplete:()=>g.destroy() });
+  }
+
+  tryDrop(killed){
+    // 小概率掉落“青石牌”
+    killed.forEach(e=>{
+      if (e.stats && e.stats.hp<=0 && Math.random()<0.4){
+        const it = this.physics.add.image(e.x, e.y, 'vj_knob').setDepth(5);
+        it.type = '青石牌';
+        this.drops.add(it);
+      }
+    });
+  }
+
+  pickupDrop(d){
+    this._hasToken = true;
+    const txt = this.add.text(d.x, d.y-30, `获得：${d.type}`, {fontSize:14, color:'#ffffaa'}).setDepth(9999);
+    this.tweens.add({ targets:txt, y:txt.y-40, alpha:0, duration:800, onComplete:()=>txt.destroy() });
+    d.destroy();
+  }
+}
+
+// -------------------------------------
+// 主菜单
+// -------------------------------------
+class MenuScene extends Phaser.Scene {
+  constructor(){ super('Menu'); }
+  create(){
+    const W = this.scale.width, H = this.scale.height;
+    const title = this.add.text(W/2, H*0.3, '廖虎传 · 风起川蜀', {fontSize:36, color:'#a8f3ff'}).setOrigin(0.5);
+    const sub = this.add.text(W/2, H*0.36, 'Part 1 原型（触屏）', {fontSize:18, color:'#e0feff'}).setOrigin(0.5);
+
+    makeRectTexture(this, 'btn_big', 260, 56, 0x002833, 0x68e1ff);
+    const btn = this.add.image(W/2, H*0.6, 'btn_big').setInteractive();
+    const label = this.add.text(btn.x, btn.y, '开始冒险', {fontSize:20, color:'#c9f7ff'}).setOrigin(0.5);
+
+    btn.on('pointerdown', ()=>{ btn.setScale(0.98); });
+    btn.on('pointerup', ()=>{ btn.setScale(1); this.scene.start('Game'); });
+
+    // 简述
+    const desc = [
+      '• 左侧摇杆移动；右侧按钮普攻/技能',
+      '• 与“老村长”交互接主线任务',
+      '• 击败敌人概率掉落“青石牌”，返回交付',
+      '• 下一章：东林古道（将在 Part 2 开放）',
+    ].join('\n');
+    this.add.text(W/2, H*0.75, desc, {fontSize:16, color:'#9fe5ff', align:'center'}).setOrigin(0.5);
+  }
+}
+
+// -------------------------------------
+// Boot/Preload（此处资源均为运行时生成，无需异步加载）
+// -------------------------------------
+class BootScene extends Phaser.Scene {
+  constructor(){ super('Boot'); }
+  preload(){}
+  create(){ this.scene.start('Menu'); }
+}
+
+// -------------------------------------
+// 启动游戏
+// -------------------------------------
+const config = {
+  type: Phaser.AUTO,
+  parent: 'game',
+  backgroundColor: '#071018',
+  scale: { mode: Phaser.Scale.FIT, autoCenter: Phaser.Scale.CENTER_BOTH, width: 960, height: 540 },
+  physics: { default: 'arcade', arcade: { gravity:{y:0}, debug:false } },
+  scene: [BootScene, MenuScene, GameScene]
+};
+
+new Phaser.Game(config);
+
+</script>
+</body>
+</html>
